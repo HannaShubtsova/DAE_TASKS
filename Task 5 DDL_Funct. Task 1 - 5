@@ -1,0 +1,250 @@
+
+-- Task 1: Create a view called 'sales_revenue_by_category_qtr' that shows the film category and total 
+--sales revenue for the current quarter and year. 
+--The view should only display categories with at least one sale in the current quarter. 
+
+
+-- Creating the view
+CREATE OR replace VIEW public.sales_revenue_by_category_qtr AS
+SELECT 
+    c.name AS category_name, 
+    SUM(p.amount) AS total_revenue  -- Total revenue (from payments)
+FROM 
+    category c
+INNER JOIN film_category fc ON c.category_id = fc.category_id
+INNER JOIN film f ON fc.film_id = f.film_id
+INNER JOIN 
+    inventory i ON f.film_id = i.film_id
+INNER JOIN 
+    rental r ON i.inventory_id = r.inventory_id
+INNER JOIN 
+    payment p ON r.rental_id = p.rental_id
+WHERE 
+    -- Filtering for the current year and quarter using EXTRACT
+    EXTRACT(YEAR FROM p.payment_date) = EXTRACT(YEAR FROM CURRENT_DATE)
+    AND EXTRACT(QUARTER FROM p.payment_date) = EXTRACT(QUARTER FROM CURRENT_DATE)
+GROUP BY 
+    c.name 
+HAVING 
+    -- Include only categories with revenue
+    SUM(p.amount) > 0;
+   
+--testing by selecting
+  SELECT * FROM sales_revenue_by_category_qtr;
+ 
+ 
+ --Task 2:Create a query language function called 'get_sales_revenue_by_category_qtr' 
+ --that accepts one parameter representing the current quarter and year and returns the same result as the 
+ --'sales_revenue_by_category_qtr' view.
+ 
+ --creating or replacing the function
+CREATE OR REPLACE FUNCTION public.get_sales_revenue_by_category_qtr(target_quarter INTEGER, target_year INTEGER)
+RETURNS TABLE (category_name TEXT, total_revenue NUMERIC) AS $$
+BEGIN
+    -- Ensuring the quarter is valid
+    IF target_quarter NOT BETWEEN 1 AND 4 THEN 
+        RAISE EXCEPTION 'Invalid quarter: %; Quarter must be between 1 and 4', target_quarter;
+    END IF;
+
+    -- Ensuring the year is valid
+    IF target_year < 1 OR target_year > EXTRACT(YEAR FROM CURRENT_DATE) THEN
+        RAISE EXCEPTION 'Invalid year: %; Year must be greater than 0 and less than or equal to the current year', target_year;
+    END IF;
+
+    -- Returning the query results
+    RETURN QUERY
+    SELECT c.name AS category_name,
+           SUM(COALESCE(p.amount, 0)) AS total_revenue
+    FROM category c
+    INNER JOIN film_category fc ON c.category_id = fc.category_id
+    INNER JOIN film f ON fc.film_id = f.film_id
+    INNER JOIN inventory i ON f.film_id = i.film_id
+    INNER JOIN rental r ON i.inventory_id = r.inventory_id
+    INNER JOIN payment p ON r.rental_id = p.rental_id
+    WHERE EXTRACT(YEAR FROM p.payment_date) = target_year
+      AND EXTRACT(QUARTER FROM p.payment_date) = target_quarter
+    GROUP BY c.name
+    HAVING SUM(p.amount) > 0;
+
+    -- Logging the execution for debugging purposes
+    RAISE NOTICE 'Function executed successfully for quarter % of year %.', target_quarter, target_year;
+END;
+$$ LANGUAGE plpgsql;
+
+--just for checking
+SELECT * FROM get_sales_revenue_by_category_qtr(2, 2017);
+
+
+--Task 3: Create a function that takes a country as an input parameter 
+--and returns the most popular film in that specific country. 
+
+--Creating or replacing the function
+CREATE OR REPLACE FUNCTION public.most_popular_films_by_countries(countries TEXT[])
+RETURNS TABLE (country_name TEXT, most_popular_film_name TEXT) AS $$
+BEGIN
+    -- Ensure the input array is not empty
+    IF array_length(countries, 1) IS NULL THEN
+        RAISE EXCEPTION 'The array of countries cannot be empty.';
+    END IF;
+
+    RETURN QUERY
+
+    SELECT DISTINCT ON (co.country) 
+        co.country AS country_name,
+        f.title AS most_popular_film_name
+    FROM country co
+    INNER JOIN city ci ON co.country_id = ci.country_id
+    INNER JOIN address a ON ci.city_id = a.city_id
+    INNER JOIN customer cu ON a.address_id = cu.address_id
+    INNER JOIN rental r ON cu.customer_id = r.customer_id
+    INNER JOIN inventory i ON r.inventory_id = i.inventory_id
+    INNER JOIN film f ON i.film_id = f.film_id
+	-- Filtering by the input array of countries
+    WHERE co.country = ANY (countries)
+    GROUP BY co.country, f.title
+    ORDER BY co.country, COUNT(r.rental_id) DESC;
+
+    RAISE NOTICE 'Function executed successfully for input countries: %.', countries;
+END;
+$$ LANGUAGE plpgsql;
+
+
+SELECT * FROM public.most_popular_films_by_countries(array['Afghanistan','Brazil','United States']);
+
+--Task 4: Create a function that generates a list of movies available in stock based on a partial title match 
+--(e.g., movies containing the word 'love' in their title). 
+
+
+
+CREATE OR REPLACE FUNCTION public.films_in_stock_by_title(title_pattern TEXT)
+RETURNS TABLE (
+    row_num BIGINT, -- Automatically generated number (matches the ROW_NUMBER() type)
+    film_title TEXT,
+    language TEXT,
+    customer_name TEXT,
+    rental_date TIMESTAMP
+) AS $$ 
+BEGIN 
+    -- Checking if there are any matching films
+    IF NOT EXISTS (
+        SELECT 1
+        FROM film f 
+        WHERE f.title ILIKE title_pattern 
+    ) THEN 
+        RAISE NOTICE 'No films matching %.', title_pattern; 
+        RETURN;
+    END IF;
+
+    -- Return the list of matching films
+    RETURN QUERY
+    SELECT 
+        ROW_NUMBER() OVER (ORDER BY f.title) AS row_num,
+        f.title AS film_title,
+        l.name::TEXT AS language,
+        CONCAT(c.first_name, ' ', c.last_name) AS customer_name,
+        r.rental_date::TIMESTAMP AS rental_date
+    FROM film f 
+    INNER JOIN "language" l ON f.language_id = l.language_id 
+    INNER JOIN inventory i ON f.film_id = i.film_id 
+	--Using LEFT JOIN to ensure the inclusion of all films that match the title pattern and language,
+    LEFT JOIN rental r ON i.inventory_id = r.inventory_id 
+    LEFT JOIN customer c ON r.customer_id = c.customer_id 
+    WHERE f.title ILIKE title_pattern
+    AND i.inventory_id NOT IN (
+        SELECT inventory_id 
+        FROM rental r 
+        WHERE return_date IS NULL -- Check if in stock
+    )
+    ORDER BY f.title;
+END;
+$$ LANGUAGE plpgsql;
+
+
+SELECT * FROM public.films_in_stock_by_title('%love%');
+
+--task 5: Create a procedure language function called 'new_movie' that takes a movie title as a parameter and 
+--inserts a new movie with the given title in the film table.
+
+CREATE OR REPLACE FUNCTION public.new_movie(
+    movie_title TEXT,
+    release_year INT DEFAULT EXTRACT(YEAR FROM CURRENT_DATE),
+    language_name TEXT DEFAULT 'Klingon'
+)
+RETURNS VOID AS $$ 
+DECLARE 
+    -- Renamed the variable to avoid conflict with the column name
+    new_film_id INT; 
+    v_language_id INT;  -- Renamed variable to avoid ambiguity
+BEGIN 
+    -- Debugging line to check what language_name is being passed
+    RAISE NOTICE 'Language name passed: "%"', language_name;
+
+    -- Checking if the language exists in the language table
+    SELECT language_id INTO v_language_id
+    FROM "language"
+    WHERE name = language_name;
+   
+    IF NOT FOUND THEN
+        -- Raise a notice and set to default 'Klingon' language_id
+        RAISE NOTICE 'Language "%s" not found. Defaulting to "Klingon".', language_name;
+
+        -- Fetch the default language_id for 'Klingon'
+        SELECT language_id INTO v_language_id
+        FROM "language"
+        WHERE name = 'Klingon';
+
+        -- If 'Klingon' is also not found, raise an exception
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Neither language "%s" nor "Klingon" found!', language_name;
+        END IF;
+    END IF;
+
+    -- Getting the next value for the film_id sequence
+    SELECT nextval('film_film_id_seq') INTO new_film_id;
+  
+    -- Inserting the new movie into the film table if it doesn't already exist
+    INSERT INTO film (
+        film_id,
+        title,
+        rental_rate,
+        rental_duration,
+        replacement_cost,
+        release_year,
+        language_id
+    )
+    SELECT 
+        new_film_id,
+        movie_title,
+        4.99,  -- Rental Rate
+        3,      -- Rental Duration in days
+        19.99,  -- Replacement Cost
+        release_year,
+        v_language_id -- Use the renamed variable v_language_id
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM film f
+        WHERE f.title = movie_title
+        AND f.language_id = v_language_id  -- Use f.language_id for the column reference
+    );
+    
+    -- Raise a notice that the movie has been added
+    RAISE NOTICE 'Movie "%s" with ID %s has been added successfully.', movie_title, new_film_id;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+
+--for this one as Klingon doesn't exist, it raises exception
+SELECT new_movie('The Klingon Adventure');
+SELECT new_movie('Sci-Fi Odyssey', 2022, 'English');
+
+SELECT * FROM film f
+ORDER BY film_id DESC 
+
+
+
+
+ 
+ 
+ 
